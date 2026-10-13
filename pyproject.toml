@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdocx2enex"
+version = "0.1.0"
+description = "Convert Samsung Notes archives to ENEX for Apple Notes"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+dependencies = ["Pillow>=10,<13", "PyMuPDF>=1.24,<2", "lxml>=5,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+sdocx2enex = "sdocx2enex.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sdocx2enex*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
