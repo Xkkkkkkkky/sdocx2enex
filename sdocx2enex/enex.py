@@ -22,6 +22,7 @@ from .text import render_text
 ENEX_DTD = "http://xml.evernote.com/pub/evernote-export3.dtd"
 ENML_DTD = "http://xml.evernote.com/pub/enml2.dtd"
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+MODIFIED_TIME_MODES = ("original", "created")
 _FILENAME_DATE = re.compile(r"_([0-9]{6})_([0-9]{6})$")
 
 
@@ -37,7 +38,7 @@ def _xml_10_character(char: str) -> bool:
 
 
 def _normalize_title(value: str, warnings: list[str]) -> str:
-    """规范化 ENEX 标题，并保留原值供报告和 metadata 使用。"""
+    """规范化 ENEX 标题，原始标题由报告单独保留。"""
     chars: list[str] = []
     line_breaks = 0
     controls = 0
@@ -77,9 +78,6 @@ def _normalize_title(value: str, warnings: list[str]) -> str:
         title = title[:255].rstrip()
         warnings.append("标题超过 255 个码点，已截短。")
 
-    if not title:
-        title = "未命名笔记"
-        warnings.append("原始标题为空，ENEX 标题已设为“未命名笔记”。")
     return title
 
 
@@ -102,24 +100,33 @@ def _report_datetime(value: datetime) -> str:
     )
 
 
-def _warn_filename_date(source: Path, created: datetime, warnings: list[str]) -> None:
-    """只将文件名末尾日期用于差异提示，不参与笔记时间推断。"""
-    match = _FILENAME_DATE.search(source.stem)
-    if not match:
-        return
-    yymmdd, _hhmmss = match.groups()
-    try:
-        file_date = datetime(
-            2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
-        ).date()
-    except ValueError:
-        return
-    note_date = created.astimezone(ZoneInfo("Asia/Shanghai")).date()
-    if file_date != note_date:
-        warnings.append(
-            f"文件名日期 {file_date.isoformat()} 与笔记创建日期 "
-            f"{note_date.isoformat()} 不同；笔记时间仍以内部时间戳为准。"
-        )
+def _select_created_time(note: Note, warnings: list[str]) -> tuple[datetime, str]:
+    """优先使用外层尾部的原始创建时间；缺失时按文件名、固定头顺序取值。"""
+    if note.display_created_ms is not None:
+        return _utc_datetime(note.display_created_ms * 1000), "display_created"
+    warnings.append("未找到文件尾部的原始创建时间，使用文件名日期或 note.note 创建时间。")
+    match = _FILENAME_DATE.search(note.source.stem)
+    if match:
+        yymmdd, hhmmss = match.groups()
+        try:
+            local = datetime(
+                2000 + int(yymmdd[:2]),
+                int(yymmdd[2:4]),
+                int(yymmdd[4:6]),
+                int(hhmmss[:2]),
+                int(hhmmss[2:4]),
+                int(hhmmss[4:6]),
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            )
+        except ValueError:
+            warnings.append("文件名时间后缀无效，已改用笔记内部创建时间。")
+        else:
+            return local.astimezone(timezone.utc), "filename"
+
+    created = _utc_datetime(note.created_us)
+    if note.created_us % 1_000_000:
+        warnings.append("内部创建时间包含微秒；ENEX 仅保存到整秒，已截去微秒。")
+    return created.replace(microsecond=0), "internal_created"
 
 
 def _append_fragment(parent: etree._Element, fragment: str) -> None:
@@ -179,20 +186,23 @@ def _add_resource(note_element: etree._Element, resource) -> None:
         etree.SubElement(attributes, "attachment").text = "true"
 
 
-def _note_element(note: Note, report: dict) -> etree._Element:
-    from .media import Resource, render_pages
+def _note_element(note: Note, report: dict, modified_time: str) -> etree._Element:
+    from .media import render_pages
 
     warnings = list(note.warnings)
     original_title = note.title.text
     title = _normalize_title(original_title, warnings)
 
-    created = _utc_datetime(note.created_us)
-    modified = _utc_datetime(note.modified_us)
-    if note.created_us % 1_000_000:
-        warnings.append("创建时间包含微秒；ENEX 仅保存到整秒，已截去微秒。")
-    if note.modified_us % 1_000_000:
-        warnings.append("更新时间包含微秒；ENEX 仅保存到整秒，已截去微秒。")
-    _warn_filename_date(note.source, created, warnings)
+    created, created_source = _select_created_time(note, warnings)
+    if modified_time == "created":
+        modified, modified_source = created, "created"
+    elif note.display_modified_ms is not None:
+        modified = _utc_datetime(note.display_modified_ms * 1000)
+        modified_source = "display_modified"
+    else:
+        modified = _utc_datetime(note.modified_us)
+        modified_source = "internal_modified"
+        warnings.append("未找到文件尾部的原始修改时间，使用 note.note 修改时间。")
 
     body_html = render_text(note.body, warnings)
     page_text_html: list[str] = []
@@ -206,34 +216,15 @@ def _note_element(note: Note, report: dict) -> etree._Element:
     if has_page_text:
         warnings.append("页面文本框已转为连续文本；文本框坐标和页面布局未还原。")
 
-    page_resources, originals, web_links_html = render_pages(note, warnings)
-    # 页面图像和附件均按约定顺序放置；源文件和 metadata 始终排在最后。
-    source_bytes = note.source.read_bytes()
-    source_hash = hashlib.sha256(source_bytes).hexdigest()
-    metadata_resource = Resource(
-        "metadata.json",
-        "application/json",
-        b"",
-    )
-    resources = [*page_resources, *originals]
-    source_resource = Resource(note.source.name, "application/octet-stream", source_bytes)
-    resources.extend((source_resource, metadata_resource))
-    _sanitize_resource_names(resources, warnings)
+    page_resources, web_links_html = render_pages(note, warnings)
+    source_hash = hashlib.sha256(note.source.read_bytes()).hexdigest()
+    _sanitize_resource_names(page_resources, warnings)
     # ink/media 可能对每个对象重复报告同一问题；保留首次出现顺序并去重。
     warnings[:] = list(dict.fromkeys(warnings))
 
-    metadata = {
-        "original_title": original_title,
-        "created_us": note.created_us,
-        "modified_us": note.modified_us,
-        "source_sha256": source_hash,
-        "warnings": warnings,
-    }
-    metadata_resource.data = (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    # metadata 在最后生成，按实际二进制 MD5 和 MIME 去重附件。
     unique_resources = []
     seen: set[tuple[str, str]] = set()
-    for resource in resources:
+    for resource in page_resources:
         key = _resource_key(resource)
         if key not in seen:
             seen.add(key)
@@ -248,39 +239,9 @@ def _note_element(note: Note, report: dict) -> etree._Element:
     for fragment in page_text_html:
         _append_fragment(enml_root, fragment)
     _append_fragment(enml_root, web_links_html)
-    embedded_keys = set()
     for resource in page_resources:
         container = etree.SubElement(enml_root, "div")
         _add_en_media(container, resource)
-        embedded_keys.add(_resource_key(resource))
-
-    original_keys = {_resource_key(resource) for resource in originals}
-    visible_originals = [
-        resource
-        for resource in unique_resources
-        if _resource_key(resource) in original_keys
-        and _resource_key(resource) not in embedded_keys
-    ]
-    if visible_originals:
-        heading = etree.SubElement(enml_root, "div")
-        etree.SubElement(heading, "b").text = "原始附件"
-        for resource in visible_originals:
-            container = etree.SubElement(enml_root, "div")
-            _add_en_media(container, resource)
-            embedded_keys.add(_resource_key(resource))
-
-    remaining_resources = [
-        resource
-        for resource in unique_resources
-        if _resource_key(resource) not in embedded_keys
-    ]
-    if remaining_resources:
-        heading = etree.SubElement(enml_root, "div")
-        etree.SubElement(heading, "b").text = "源文件与精确时间元数据"
-        for resource in remaining_resources:
-            container = etree.SubElement(enml_root, "div")
-            _add_en_media(container, resource)
-            embedded_keys.add(_resource_key(resource))
 
     enml = etree.tostring(
         enml_root,
@@ -290,7 +251,9 @@ def _note_element(note: Note, report: dict) -> etree._Element:
     ).decode("utf-8")
 
     note_element = etree.Element("note")
-    etree.SubElement(note_element, "title").text = title
+    title_element = etree.SubElement(note_element, "title")
+    if title:
+        title_element.text = title
     etree.SubElement(note_element, "content").text = etree.CDATA(enml)
     etree.SubElement(note_element, "created").text = _enex_datetime(created)
     etree.SubElement(note_element, "updated").text = _enex_datetime(modified)
@@ -301,10 +264,15 @@ def _note_element(note: Note, report: dict) -> etree._Element:
         {
             "title": title,
             "original_title": original_title,
-            "created_us": note.created_us,
-            "modified_us": note.modified_us,
+            "source_created_us": note.created_us,
+            "source_modified_us": note.modified_us,
             "created_utc": _report_datetime(created),
             "modified_utc": _report_datetime(modified),
+            "display_created_ms": note.display_created_ms,
+            "display_modified_ms": note.display_modified_ms,
+            "created_time_source": created_source,
+            "modified_time_source": modified_source,
+            "modified_time_mode": modified_time,
             "text_characters": len(note.body.text) + page_text_count,
             "page_count": len(note.pages),
             "stroke_count": sum(
@@ -322,12 +290,16 @@ def _note_element(note: Note, report: dict) -> etree._Element:
     return note_element
 
 
-def convert_note(path: str | Path) -> tuple[etree._Element, dict]:
+def convert_note(
+    path: str | Path, *, modified_time: str = "original"
+) -> tuple[etree._Element, dict]:
     """转换单个 SDocx，返回 ENEX note 元素和逐笔记报告。"""
+    if modified_time not in MODIFIED_TIME_MODES:
+        raise ValueError(f"未知修改时间模式：{modified_time}")
     source = Path(path)
     note = parse_sdocx(source)
     report = {"source": str(source)}
-    element = _note_element(note, report)
+    element = _note_element(note, report, modified_time)
     return element, report
 
 
@@ -363,10 +335,15 @@ def _failed_report(source: Path, error: Exception) -> dict:
         "source": str(source),
         "title": None,
         "original_title": None,
-        "created_us": None,
-        "modified_us": None,
+        "source_created_us": None,
+        "source_modified_us": None,
         "created_utc": None,
         "modified_utc": None,
+        "display_created_ms": None,
+        "display_modified_ms": None,
+        "created_time_source": None,
+        "modified_time_source": None,
+        "modified_time_mode": None,
         "text_characters": 0,
         "page_count": 0,
         "stroke_count": 0,
@@ -396,9 +373,12 @@ def _stage_file(path: Path, data: bytes) -> Path:
 
 
 def build_enex(
-    paths: Iterable[str | Path], output: str | Path, report_path: str | Path
+    paths: Iterable[str | Path], output: str | Path, report_path: str | Path,
+    *, modified_time: str = "original",
 ) -> dict:
     """转换输入集合并原子写入成功笔记和逐文件 JSON 报告。"""
+    if modified_time not in MODIFIED_TIME_MODES:
+        raise ValueError(f"未知修改时间模式：{modified_time}")
     sources = [Path(path) for path in paths]
     output_path = Path(output)
     report_file = Path(report_path)
@@ -410,7 +390,7 @@ def build_enex(
     file_reports: list[dict] = []
     for source in sources:
         try:
-            note_element, one_report = convert_note(source)
+            note_element, one_report = convert_note(source, modified_time=modified_time)
             note_elements.append(note_element)
             file_reports.append(one_report)
         except Exception as error:
@@ -426,6 +406,7 @@ def build_enex(
         status = "failed"
 
     result = {
+        "modified_time_mode": modified_time,
         "output": str(output_path),
         "report": str(report_file),
         "status": status,

@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .enex import build_enex
+from .enex import MODIFIED_TIME_MODES, build_enex
 
 
 def _collect_inputs(input_path: Path) -> list[Path]:
@@ -38,6 +38,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("input", type=Path, help="一个 .sdocx 文件或递归扫描的目录")
     parser.add_argument("-o", "--output", required=True, type=Path, help="ENEX 输出路径")
     parser.add_argument("--report", type=Path, help="JSON 报告路径，默认与输出同名 .report.json")
+    parser.add_argument(
+        "--modified-time", choices=MODIFIED_TIME_MODES, default="original",
+        help="修改时间：original 保留原始修改时间（默认）；created 设为创建时间",
+    )
     return parser
 
 
@@ -51,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report_path = args.report or args.output.with_suffix(".report.json")
     try:
-        report = build_enex(inputs, args.output, report_path)
+        report = build_enex(inputs, args.output, report_path, modified_time=args.modified_time)
     except Exception as error:
         print(f"转换失败：{error}", file=sys.stderr)
         return 1

@@ -15,6 +15,9 @@ from typing import TypeAlias
 
 MAX_MEMBER_SIZE = 128 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_SIZE = 512 * 1024 * 1024
+MAX_EOCD_TAIL_SCAN_BYTES = 131094
+ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+SDOCX_END_TAG_SDK = b"Document for S-Pen SDK"
 
 
 class Reader:
@@ -186,6 +189,8 @@ class Note:
     media: dict[str, bytes]
     warnings: list[str]
     media_info: bytes
+    display_created_ms: int | None = None
+    display_modified_ms: int | None = None
 
 
 def parse_page_id_info(data: bytes) -> list[str]:
@@ -432,6 +437,74 @@ def _validate_page_uuid(uuid: str) -> None:
         raise ValueError(f"pageIdInfo.dat 中含有非法页面 UUID：{uuid!r}")
 
 
+def _read_display_times(source: Path) -> tuple[int | None, int | None]:
+    # 外层 ZIP 的 EOCD 尾部不同于成员 end_tag.bin；显示时间以毫秒存储，已用 15 个样例验证。
+    with source.open("rb") as file:
+        file.seek(0, 2)
+        file_size = file.tell()
+        file.seek(max(0, file_size - MAX_EOCD_TAIL_SCAN_BYTES))
+        trailer = file.read()
+
+    eocd_offset = trailer.rfind(ZIP_EOCD_SIGNATURE)
+    if eocd_offset < 0:
+        raise ValueError("ZIP 尾部未找到 EOCD")
+    if eocd_offset + 22 > len(trailer):
+        raise ValueError("ZIP EOCD 记录不完整")
+
+    comment_length = struct.unpack_from("<H", trailer, eocd_offset + 20)[0]
+    tag_offset = eocd_offset + 22 + comment_length
+    if tag_offset > len(trailer):
+        raise ValueError("ZIP EOCD 注释长度越过文件尾部")
+
+    tag = trailer[tag_offset:]
+    if not tag:
+        return None, None
+    if len(tag) < 2 + len(SDOCX_END_TAG_SDK) or not tag.endswith(SDOCX_END_TAG_SDK):
+        raise ValueError("ZIP EOCD 后尾部缺少有效的 S-Pen SDK 标识")
+
+    reader = Reader(tag[:-len(SDOCX_END_TAG_SDK)])
+    declared_length = reader.u16()
+    if declared_length + 2 != len(tag):
+        raise ValueError("外层 end tag 声明长度与实际尾部长度不符")
+
+    reader.u32()  # format version
+    reader.short_u16_string()  # note UUID
+    reader.i64()  # modified time
+    reader.u32()  # flags
+    reader.short_u16_string()  # cover image
+    reader.u32()  # width
+    reader.f32()  # height
+    reader.short_u16_string()  # app name
+    reader.u32()  # app version major
+    reader.u32()  # app version minor
+    reader.short_u16_string()  # app version patch
+    reader.u32()  # minimum format version
+    reader.i64()  # created time
+    reader.u32()  # last viewed page
+    reader.u16()  # page model
+
+    if reader.pos == len(reader.data):
+        return None, None
+
+    document_type = reader.u16()
+    if document_type != 0:
+        raise ValueError(f"外层 end tag 文档类型不受支持：{document_type}")
+    reader.short_u16_string()  # owner id
+    reader.read(reader.u32())  # unknown bytes
+    encryption_length = reader.u32()
+    if encryption_length != 0:
+        raise ValueError("外层 end tag 含加密数据")
+
+    display_created_ms = reader.i64()
+    display_modified_ms = reader.i64()
+    if display_created_ms <= 0 or display_modified_ms <= 0:
+        raise ValueError("外层 end tag 显示时间必须为正数")
+    if display_created_ms > display_modified_ms:
+        raise ValueError("外层 end tag 创建显示时间晚于修改显示时间")
+
+    return display_created_ms, display_modified_ms
+
+
 def parse_sdocx(path: str | Path) -> Note:
     """读取一个 .sdocx ZIP，保留所有页面对象原始字节和媒体文件。"""
     source = Path(path)
@@ -476,6 +549,8 @@ def parse_sdocx(path: str | Path) -> Note:
             and not members[name].is_dir()
         }
 
+    display_created_ms, display_modified_ms = _read_display_times(source)
+
     return Note(
         source=source,
         title=title,
@@ -486,4 +561,6 @@ def parse_sdocx(path: str | Path) -> Note:
         media=media,
         warnings=[],
         media_info=media_info,
+        display_created_ms=display_created_ms,
+        display_modified_ms=display_modified_ms,
     )

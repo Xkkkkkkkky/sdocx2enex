@@ -293,17 +293,31 @@ def _path_width(size: float, scale: float, pressure: float) -> float:
     return max(1.0, width)
 
 
-def _draw_path(draw: ImageDraw.ImageDraw, points, color, size: float, scale: float) -> None:
+def _draw_path(
+    draw: ImageDraw.ImageDraw,
+    points,
+    color,
+    size: float,
+    scale: float,
+    y_offset: int = 0,
+) -> None:
     if not points:
         return
     widths = [_path_width(size, scale, point[2]) for point in points]
     for i in range(len(points) - 1):
         width = max(1, round((widths[i] + widths[i + 1]) / 2))
-        draw.line((points[i][0], points[i][1], points[i + 1][0], points[i + 1][1]), fill=color, width=width)
+        # 先按全页像素坐标向零截断，再减去块偏移，保持分块与整页栅格化一致。
+        draw.line((
+            int(points[i][0]), int(points[i][1]) - y_offset,
+            int(points[i + 1][0]), int(points[i + 1][1]) - y_offset,
+        ), fill=color, width=width)
     # 用圆形补齐端帽和拐点；每条 stroke 会先画在独立 layer，避免半透明笔刷自相叠黑。
     for (x, y, _pressure), width in zip(points, widths):
         radius = width / 2
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+        left, top, right, bottom = (
+            int(x - radius), int(y - radius), int(x + radius), int(y + radius)
+        )
+        draw.ellipse((left, top - y_offset, right, bottom - y_offset), fill=color)
 
 
 def draw_strokes(
@@ -311,6 +325,8 @@ def draw_strokes(
     size: tuple[int, int],
     scale: float,
     origin: tuple[float, float] = (0, 0),
+    *,
+    y_offset: int = 0,
 ) -> Image.Image:
     """以透明 RGBA 图层绘制笔迹；画布边界与总像素数会严格检查。"""
     if len(size) != 2:
@@ -324,6 +340,7 @@ def draw_strokes(
         raise ValueError(f"绘制比例必须是有限正数：{scale}")
     if len(origin) != 2 or any(not math.isfinite(value) for value in origin):
         raise ValueError("绘制原点必须是两个有限坐标")
+    y_offset = index(y_offset)
 
     ink = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     for stroke in strokes:
@@ -369,12 +386,12 @@ def draw_strokes(
         is_eraser = bool(stroke["property"] & (1 << 3)) or stroke["tool"] == 4
         if is_eraser:
             mask = Image.new("L", (width, height), 0)
-            _draw_path(ImageDraw.Draw(mask), transformed, 255, base_size, scale)
+            _draw_path(ImageDraw.Draw(mask), transformed, 255, base_size, scale, y_offset)
             ink.putalpha(ImageChops.subtract(ink.getchannel("A"), mask))
             continue
 
         layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        _draw_path(ImageDraw.Draw(layer), transformed, color, base_size, scale)
+        _draw_path(ImageDraw.Draw(layer), transformed, color, base_size, scale, y_offset)
         ink.alpha_composite(layer)
 
     return ink

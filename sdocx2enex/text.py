@@ -229,9 +229,8 @@ def _span_attributes(
 
 
 def _escape_text(text: str) -> str:
-    # U+FFFC 是 Android 的内嵌对象占位符；此处替换不会影响原始 span 偏移。
-    escaped = html.escape(text, quote=True)
-    return escaped.replace("\uFFFC", "[嵌入对象见页面图像]")
+    # 保留原始 U+FFFC 对象占位符，不向正文添加解释文字。
+    return html.escape(text, quote=True)
 
 
 def _render_range(text: str, attrs: list[dict], start: int, end: int) -> str:
@@ -287,7 +286,7 @@ def render_text(t: TextObject, warnings: list[str]) -> str:
         if char == "\uFFFC":
             utf16_offset = boundaries[index]
             warnings.append(
-                f"文本 UTF-16 偏移 {utf16_offset} 含 U+FFFC：嵌入对象位置未恢复，已显示占位文本。"
+                f"文本 UTF-16 偏移 {utf16_offset} 含 U+FFFC：嵌入对象位置未恢复，保留原始占位字符。"
             )
 
     line_ranges = _split_lines(text)
